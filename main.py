@@ -15,6 +15,9 @@ import sys
 import uuid
 import time
 import traceback
+import termios
+import fcntl
+
 console = Console()
 # Configuration
 ISOLATOR_DIR = Path.home() / ".isolator-apps"
@@ -25,6 +28,53 @@ DESKTOP_DIR = Path.home() / ".local/share/applications"
 # Ensure directories exist
 for directory in [IMAGES, CONTAINERS, BIN, DESKTOP_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+def get_key():
+    fd = sys.stdin.fileno()
+    oldterm = termios.tcgetattr(fd)
+    newattr = termios.tcgetattr(fd)
+    newattr[3] = newattr[3] & ~termios.ICANON & ~termios.ECHO
+    termios.tcsetattr(fd, termios.TCSANOW, newattr)
+    oldflags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
+    try:
+        while True:
+            try:
+                c = sys.stdin.read(1)
+                if c:
+                    termios.tcsetattr(fd, termios.TCDRAIN, oldterm)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
+                    return c
+            except IOError:
+                pass
+    finally:
+        termios.tcsetattr(fd, termios.TCDRAIN, oldterm)
+        fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
+
+def choose_yes_no():
+    options = ["Tak", "Nie"]
+    selected = 0
+    while True:
+        console.clear()
+        console.print("[bold cyan]Pakiet nie znaleziony w standardowych repozytoriach. Czy sprawdzić AUR?[/bold cyan]\n")
+        for i, opt in enumerate(options):
+            if i == selected:
+                console.print(f"> [bold green]{opt}[/bold green]")
+            else:
+                console.print(f"  [white]{opt}[/white]")
+        key = get_key()
+        if key == '\x1b':  # escape sequence for arrows
+            next_key = get_key()  # should be '['
+            if next_key == '[':
+                direction = get_key()
+                if direction == 'A':  # up
+                    selected = (selected - 1) % len(options)
+                elif direction == 'B':  # down
+                    selected = (selected + 1) % len(options)
+        elif key in ('\r', '\n'):  # enter
+            console.clear()
+            return options[selected] == "Tak"
+
 def print_header():
     console.print("\n")
     title = Text("Isolator: Kontenerowy Menedżer Pakietów", style="bold white")
@@ -39,6 +89,7 @@ def print_header():
         box=ROUNDED
     ))
     console.print("\n")
+
 def show_help():
     table = Table(
         title="Dostępne Komendy",
@@ -70,6 +121,7 @@ def show_help():
         box=ROUNDED
     ))
     console.print("\n")
+
 def create_container_image(pkg):
     image_name = IMAGES / f"{pkg}.img"
     run_script = BIN / f"run-{pkg}.sh"
@@ -95,14 +147,33 @@ def create_container_image(pkg):
             # Create base container
             subtask = progress.add_task(stages[0][0], total=None, style=stages[0][2])
             console.print(f"[bold {stages[0][2]}]>> {stages[0][0]} dla {pkg}...[/bold {stages[0][2]}]")
-            cid = subprocess.check_output(["podman", "create", "-it", "fedora:latest", "/bin/bash"]).decode().strip()
+            cid = subprocess.check_output(["podman", "create", "-it", "archlinux", "/bin/bash"]).decode().strip()
             progress.update(main_task, advance=stages[0][1])
             progress.remove_task(subtask)
             time.sleep(0.2) # Smooth transition
             # Install package
             subtask = progress.add_task(stages[1][0], total=None, style=stages[1][2])
             console.print(f"[bold {stages[1][2]}]>> {stages[1][0]} {pkg}...[/bold {stages[1][2]}]")
-            subprocess.run(["podman", "start", "-ai", cid, "-c", f"dnf install -y {pkg}"], check=True)
+            # First update system
+            subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], check=True)
+            # Try to install with pacman
+            proc = subprocess.run(["podman", "start", "-ai", cid, "-c", f"pacman -S --noconfirm {pkg}"], capture_output=True, check=False)
+            if proc.returncode != 0:
+                error_output = proc.stderr.decode()
+                if "target not found" in error_output.lower():
+                    if choose_yes_no():
+                        # Install dependencies for AUR
+                        subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -S --needed --noconfirm git base-devel sudo"], check=True)
+                        # Create builder user
+                        subprocess.run(["podman", "start", "-ai", cid, "-c", "useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"], check=True)
+                        # Install yay-bin
+                        subprocess.run(["podman", "start", "-ai", cid, "-c", 'su builder -c "git clone https://aur.archlinux.org/yay-bin.git ~/yay-bin && cd ~/yay-bin && makepkg -si --noconfirm"'], check=True)
+                        # Install package with yay
+                        subprocess.run(["podman", "start", "-ai", cid, "-c", f'su builder -c "yay -S --noconfirm {pkg}"'], check=True)
+                    else:
+                        raise subprocess.CalledProcessError(proc.returncode, proc.args, proc.stdout, proc.stderr)
+                else:
+                    raise subprocess.CalledProcessError(proc.returncode, proc.args, proc.stdout, proc.stderr)
             progress.update(main_task, advance=stages[1][1])
             progress.remove_task(subtask)
             time.sleep(0.2)
@@ -131,7 +202,7 @@ podman run --rm -it \\
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \\
     -v $HOME:/home/user:rw \\
     --device /dev/dri \\
-    {image_name}
+    {image_name} {pkg}
 """)
             run_script.chmod(0o755)
             with open(DESKTOP_DIR / f"{pkg}.desktop", "w") as f:
@@ -160,6 +231,7 @@ Terminal=false
             console.print("[red]Szczegóły błędu:[/red]")
             console.print(traceback.format_exc())
         sys.exit(1)
+
 def run_container(pkg):
     run_script = BIN / f"run-{pkg}.sh"
     if not run_script.exists():
@@ -196,6 +268,7 @@ def run_container(pkg):
             console.print("[red]Szczegóły błędu:[/red]")
             console.print(traceback.format_exc())
         sys.exit(1)
+
 def update_all():
     images = list(IMAGES.glob("*.img"))
     if not images:
@@ -225,7 +298,7 @@ def update_all():
                 subtask = progress.add_task(f"Aktualizacja {name}", total=None)
                 console.print(f"[bold cyan]>> Aktualizowanie {name}...[/bold cyan]")
                 cid = subprocess.check_output(["podman", "create", "-it", str(image), "/bin/bash"]).decode().strip()
-                subprocess.run(["podman", "start", "-ai", cid, "-c", "dnf update -y"], check=True)
+                subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], check=True)
                 subprocess.run(["podman", "commit", cid, str(image)], check=True)
                 subprocess.run(["podman", "rm", cid], check=True)
                 progress.update(main_task, advance=100)
@@ -252,6 +325,7 @@ def update_all():
             console.print("[red]Szczegóły błędu:[/red]")
             console.print(traceback.format_exc())
         sys.exit(1)
+
 def list_packages():
     images = list(IMAGES.glob("*.img"))
     if not images:
@@ -285,6 +359,7 @@ def list_packages():
         box=ROUNDED
     ))
     console.print("\n")
+
 def main():
     print_header()
     if len(sys.argv) < 2 or sys.argv[1] in ["help", "?"]:
@@ -307,7 +382,7 @@ def main():
         elif command == "run":
             if len(sys.argv) != 3:
                 console.print(Panel(
-                    "[bold red]Błąd: Użycie: isolator run steam[/bold red]\n"
+                    "[bold red]Błąd: Użycie: isolator run <pakiet>[/bold red]\n"
                     "[red]Przykład: isolator run pakiet[/red]",
                     border_style="red",
                     padding=(1, 2),
@@ -343,6 +418,6 @@ def main():
             console.print("[red]Szczegóły błędu:[/red]")
             console.print(traceback.format_exc())
         sys.exit(1)
+
 if __name__ == "__main__":
     main()
-
