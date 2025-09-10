@@ -17,17 +17,30 @@ import time
 import traceback
 import termios
 import fcntl
+import logging
 
 console = Console()
+
 # Configuration
 ISOLATOR_DIR = Path.home() / ".isolator-apps"
 IMAGES = ISOLATOR_DIR / "images"
 CONTAINERS = ISOLATOR_DIR / "containers"
 BIN = ISOLATOR_DIR / "bin"
 DESKTOP_DIR = Path.home() / ".local/share/applications"
+LOG_FILE = Path("/tmp/isolator.log")
+
 # Ensure directories exist
 for directory in [IMAGES, CONTAINERS, BIN, DESKTOP_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a"
+)
+logger = logging.getLogger(__name__)
 
 def get_key():
     fd = sys.stdin.fileno()
@@ -61,17 +74,17 @@ def choose_yes_no():
             if i == selected:
                 console.print(f"> [bold green]{opt}[/bold green]")
             else:
-                console.print(f"  [white]{opt}[/white]")
+                console.print(f" [white]{opt}[/white]")
         key = get_key()
-        if key == '\x1b':  # escape sequence for arrows
-            next_key = get_key()  # should be '['
+        if key == '\x1b': # escape sequence for arrows
+            next_key = get_key() # should be '['
             if next_key == '[':
                 direction = get_key()
-                if direction == 'A':  # up
+                if direction == 'A': # up
                     selected = (selected - 1) % len(options)
-                elif direction == 'B':  # down
+                elif direction == 'B': # down
                     selected = (selected + 1) % len(options)
-        elif key in ('\r', '\n'):  # enter
+        elif key in ('\r', '\n'): # enter
             console.clear()
             return options[selected] == "Tak"
 
@@ -138,62 +151,102 @@ def create_container_image(pkg):
         ) as progress:
             main_task = progress.add_task(f"Instalacja {pkg}", total=100)
             stages = [
-                ("Tworzenie kontenera bazowego", 20, "blue"),
+                ("Pobieranie obrazu bazowego", 10, "purple"),
+                ("Tworzenie kontenera bazowego", 10, "blue"),
                 ("Instalowanie pakietu", 40, "cyan"),
                 ("Zapisywanie obrazu", 20, "green"),
                 ("Usuwanie tymczasowego kontenera", 10, "yellow"),
                 ("Tworzenie skryptu i pliku .desktop", 10, "magenta")
             ]
-            # Create base container
+            current_advance = 0
+
+            # Download base image
             subtask = progress.add_task(stages[0][0], total=None, style=stages[0][2])
-            console.print(f"[bold {stages[0][2]}]>> {stages[0][0]} dla {pkg}...[/bold {stages[0][2]}]")
-            cid = subprocess.check_output(["podman", "create", "-it", "archlinux", "/bin/bash"]).decode().strip()
+            console.print(f"[bold {stages[0][2]}]>> {stages[0][0]}...[/bold {stages[0][2]}]")
+            proc = subprocess.run(["podman", "pull", "archlinux"], capture_output=True, check=True)
+            logger.info(f"Pull archlinux stdout: {proc.stdout.decode()}")
+            logger.info(f"Pull archlinux stderr: {proc.stderr.decode()}")
             progress.update(main_task, advance=stages[0][1])
+            current_advance += stages[0][1]
             progress.remove_task(subtask)
             time.sleep(0.2) # Smooth transition
-            # Install package
+
+            # Create base container
             subtask = progress.add_task(stages[1][0], total=None, style=stages[1][2])
-            console.print(f"[bold {stages[1][2]}]>> {stages[1][0]} {pkg}...[/bold {stages[1][2]}]")
+            console.print(f"[bold {stages[1][2]}]>> {stages[1][0]} dla {pkg}...[/bold {stages[1][2]}]")
+            output = subprocess.check_output(["podman", "create", "-it", "archlinux", "/bin/bash"], stderr=subprocess.STDOUT)
+            cid = output.decode().strip()
+            logger.info(f"Create container stdout: {output.decode()}")
+            progress.update(main_task, advance=stages[1][1])
+            current_advance += stages[1][1]
+            progress.remove_task(subtask)
+            time.sleep(0.2) # Smooth transition
+
+            # Install package
+            subtask = progress.add_task(stages[2][0], total=None, style=stages[2][2])
+            console.print(f"[bold {stages[2][2]}]>> {stages[2][0]} {pkg}...[/bold {stages[2][2]}]")
             # First update system
-            subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], check=True)
+            proc = subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], capture_output=True, check=True)
+            logger.info(f"Update system stdout: {proc.stdout.decode()}")
+            logger.info(f"Update system stderr: {proc.stderr.decode()}")
             # Try to install with pacman
             proc = subprocess.run(["podman", "start", "-ai", cid, "-c", f"pacman -S --noconfirm {pkg}"], capture_output=True, check=False)
+            logger.info(f"Install pacman stdout: {proc.stdout.decode()}")
+            logger.info(f"Install pacman stderr: {proc.stderr.decode()}")
             if proc.returncode != 0:
                 error_output = proc.stderr.decode()
                 if "target not found" in error_output.lower():
                     if choose_yes_no():
                         # Install dependencies for AUR
-                        subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -S --needed --noconfirm git base-devel sudo"], check=True)
+                        proc = subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -S --needed --noconfirm git base-devel sudo"], capture_output=True, check=True)
+                        logger.info(f"Install AUR deps stdout: {proc.stdout.decode()}")
+                        logger.info(f"Install AUR deps stderr: {proc.stderr.decode()}")
                         # Create builder user
-                        subprocess.run(["podman", "start", "-ai", cid, "-c", "useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"], check=True)
+                        proc = subprocess.run(["podman", "start", "-ai", cid, "-c", "useradd -m builder && echo 'builder ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"], capture_output=True, check=True)
+                        logger.info(f"Create builder stdout: {proc.stdout.decode()}")
+                        logger.info(f"Create builder stderr: {proc.stderr.decode()}")
                         # Install yay-bin
-                        subprocess.run(["podman", "start", "-ai", cid, "-c", 'su builder -c "git clone https://aur.archlinux.org/yay-bin.git ~/yay-bin && cd ~/yay-bin && makepkg -si --noconfirm"'], check=True)
+                        proc = subprocess.run(["podman", "start", "-ai", cid, "-c", 'su builder -c "git clone https://aur.archlinux.org/yay-bin.git ~/yay-bin && cd ~/yay-bin && makepkg -si --noconfirm"'], capture_output=True, check=True)
+                        logger.info(f"Install yay stdout: {proc.stdout.decode()}")
+                        logger.info(f"Install yay stderr: {proc.stderr.decode()}")
                         # Install package with yay
-                        subprocess.run(["podman", "start", "-ai", cid, "-c", f'su builder -c "yay -S --noconfirm {pkg}"'], check=True)
+                        proc = subprocess.run(["podman", "start", "-ai", cid, "-c", f'su builder -c "yay -S --noconfirm {pkg}"'], capture_output=True, check=True)
+                        logger.info(f"Install with yay stdout: {proc.stdout.decode()}")
+                        logger.info(f"Install with yay stderr: {proc.stderr.decode()}")
                     else:
                         raise subprocess.CalledProcessError(proc.returncode, proc.args, proc.stdout, proc.stderr)
                 else:
                     raise subprocess.CalledProcessError(proc.returncode, proc.args, proc.stdout, proc.stderr)
-            progress.update(main_task, advance=stages[1][1])
-            progress.remove_task(subtask)
-            time.sleep(0.2)
-            # Commit image
-            subtask = progress.add_task(stages[2][0], total=None, style=stages[2][2])
-            console.print(f"[bold {stages[2][2]}]>> {stages[2][0]}...[/bold {stages[2][2]}]")
-            subprocess.run(["podman", "commit", cid, str(image_name)], check=True)
             progress.update(main_task, advance=stages[2][1])
+            current_advance += stages[2][1]
             progress.remove_task(subtask)
             time.sleep(0.2)
-            # Remove temporary container
+
+            # Commit image
             subtask = progress.add_task(stages[3][0], total=None, style=stages[3][2])
             console.print(f"[bold {stages[3][2]}]>> {stages[3][0]}...[/bold {stages[3][2]}]")
-            subprocess.run(["podman", "rm", cid], check=True)
+            proc = subprocess.run(["podman", "commit", cid, str(image_name)], capture_output=True, check=True)
+            logger.info(f"Commit image stdout: {proc.stdout.decode()}")
+            logger.info(f"Commit image stderr: {proc.stderr.decode()}")
             progress.update(main_task, advance=stages[3][1])
+            current_advance += stages[3][1]
             progress.remove_task(subtask)
             time.sleep(0.2)
-            # Create run script and .desktop file
+
+            # Remove temporary container
             subtask = progress.add_task(stages[4][0], total=None, style=stages[4][2])
             console.print(f"[bold {stages[4][2]}]>> {stages[4][0]}...[/bold {stages[4][2]}]")
+            proc = subprocess.run(["podman", "rm", cid], capture_output=True, check=True)
+            logger.info(f"Remove container stdout: {proc.stdout.decode()}")
+            logger.info(f"Remove container stderr: {proc.stderr.decode()}")
+            progress.update(main_task, advance=stages[4][1])
+            current_advance += stages[4][1]
+            progress.remove_task(subtask)
+            time.sleep(0.2)
+
+            # Create run script and .desktop file
+            subtask = progress.add_task(stages[5][0], total=None, style=stages[5][2])
+            console.print(f"[bold {stages[5][2]}]>> {stages[5][0]}...[/bold {stages[5][2]}]")
             with open(run_script, "w") as f:
                 f.write(f"""#!/bin/bash
 xhost +SI:localuser:$USER
@@ -213,8 +266,14 @@ Icon={pkg}
 Type=Application
 Terminal=false
 """)
-            progress.update(main_task, advance=stages[4][1])
+            progress.update(main_task, advance=stages[5][1])
+            current_advance += stages[5][1]
             progress.remove_task(subtask)
+
+            # Ensure progress reaches 100%
+            if current_advance < 100:
+                progress.update(main_task, advance=100 - current_advance)
+
         console.print(Panel(
             f"[bold green]Sukces: Pakiet {pkg} został zainstalowany i skonfigurowany![/bold green]",
             border_style="green",
@@ -224,6 +283,7 @@ Terminal=false
         ))
         console.print("\n")
     except subprocess.CalledProcessError as e:
+        logger.error(f"CalledProcessError: {str(e)} - stdout: {e.stdout.decode() if e.stdout else ''} - stderr: {e.stderr.decode() if e.stderr else ''}")
         error_msg = f"[bold red]Błąd podczas instalacji {pkg}: {str(e)}[/bold red]\n"
         error_msg += "[red]Sprawdź, czy pakiet istnieje i czy podman jest prawidłowo skonfigurowany.[/red]"
         console.print(Panel(error_msg, border_style="red", padding=(1, 2), style="on #2d1a1a", box=ROUNDED))
@@ -252,10 +312,13 @@ def run_container(pkg):
             console=console
         ) as progress:
             task = progress.add_task("Uruchamianie...", total=None)
-            subprocess.run([str(run_script)], check=True)
+            proc = subprocess.run([str(run_script)], capture_output=True, check=True)
+            logger.info(f"Run {pkg} stdout: {proc.stdout.decode()}")
+            logger.info(f"Run {pkg} stderr: {proc.stderr.decode()}")
             progress.remove_task(task)
         console.print(f"[bold green]{pkg} uruchomiony pomyślnie[/bold green]\n")
     except subprocess.CalledProcessError as e:
+        logger.error(f"Run error: {str(e)} - stdout: {e.stdout.decode() if e.stdout else ''} - stderr: {e.stderr.decode() if e.stderr else ''}")
         console.print(Panel(
             f"[bold red]Błąd podczas uruchamiania {pkg}: {str(e)}[/bold red]\n"
             f"[red]Sprawdź konfigurację podman i uprawnienia.[/red]",
@@ -297,10 +360,18 @@ def update_all():
                 name = image.stem
                 subtask = progress.add_task(f"Aktualizacja {name}", total=None)
                 console.print(f"[bold cyan]>> Aktualizowanie {name}...[/bold cyan]")
-                cid = subprocess.check_output(["podman", "create", "-it", str(image), "/bin/bash"]).decode().strip()
-                subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], check=True)
-                subprocess.run(["podman", "commit", cid, str(image)], check=True)
-                subprocess.run(["podman", "rm", cid], check=True)
+                output = subprocess.check_output(["podman", "create", "-it", str(image), "/bin/bash"], stderr=subprocess.STDOUT)
+                cid = output.decode().strip()
+                logger.info(f"Create for update stdout: {output.decode()}")
+                proc = subprocess.run(["podman", "start", "-ai", cid, "-c", "pacman -Syu --noconfirm"], capture_output=True, check=True)
+                logger.info(f"Update {name} stdout: {proc.stdout.decode()}")
+                logger.info(f"Update {name} stderr: {proc.stderr.decode()}")
+                proc = subprocess.run(["podman", "commit", cid, str(image)], capture_output=True, check=True)
+                logger.info(f"Commit update stdout: {proc.stdout.decode()}")
+                logger.info(f"Commit update stderr: {proc.stderr.decode()}")
+                proc = subprocess.run(["podman", "rm", cid], capture_output=True, check=True)
+                logger.info(f"Remove update stdout: {proc.stdout.decode()}")
+                logger.info(f"Remove update stderr: {proc.stderr.decode()}")
                 progress.update(main_task, advance=100)
                 progress.remove_task(subtask)
                 time.sleep(0.2)
@@ -313,6 +384,7 @@ def update_all():
         ))
         console.print("\n")
     except subprocess.CalledProcessError as e:
+        logger.error(f"Update error: {str(e)} - stdout: {e.stdout.decode() if e.stdout else ''} - stderr: {e.stderr.decode() if e.stderr else ''}")
         console.print(Panel(
             f"[bold red]Błąd podczas aktualizacji: {str(e)}[/bold red]\n"
             f"[red]Sprawdź połączenie sieciowe i konfigurację podman.[/red]",
@@ -406,6 +478,7 @@ def main():
             ))
             console.print("\n")
     except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
         console.print(Panel(
             f"[bold red]Nieoczekiwany błąd: {str(e)}[/bold red]\n"
             f"[red]Spróbuj ponownie lub sprawdź konfigurację systemu.[/red]",
@@ -420,4 +493,6 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
+    logger.info("Starting isolator script")
     main()
+    logger.info("Ending isolator script")
